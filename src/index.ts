@@ -22,6 +22,26 @@ export interface AuthRequestInit extends Omit<RequestInit, 'method' | 'headers' 
   body?: BodyInit | Record<string, unknown> | unknown[] | null | undefined;
 }
 
+export interface AuthBodyRequestInit extends AuthRequestInit {
+  /**
+   * When true, serializes JSON-like bodies into multipart form-data.
+   *
+   * This is useful for endpoints that expect the payload in a single form field
+   * (for example, `body`) alongside uploaded files.
+   */
+  multipart?: boolean;
+  /**
+   * The form field that receives the serialized payload when `multipart` is enabled.
+   * Defaults to `body`.
+   */
+  multipartBodyFieldName?: string;
+  /**
+   * Optional form-data payload to merge into the outgoing request.
+   * Existing entries (e.g., files) are preserved.
+   */
+  formData?: FormData;
+}
+
 const WEB_DEVICE_ID_CACHE = new Map<string, string>();
 const DEVICE_SERIAL_KEY_PROMISES = new WeakMap<AuthHttpClient, Promise<string>>();
 const IP_ADDRESS_PROMISES = new WeakMap<AuthHttpClient, Promise<string>>();
@@ -31,6 +51,8 @@ interface RequiredAuthMaterial {
   token: string;
   publicKeyPem: string;
 }
+
+const METHODS_WITHOUT_REQUEST_BODY = new Set(['GET', 'HEAD', 'DELETE', 'CONNECT', 'TRACE']);
 
 function requireAuthMaterial(client: AuthHttpClient): RequiredAuthMaterial {
   if (!client.userId) {
@@ -52,7 +74,8 @@ function requireAuthMaterial(client: AuthHttpClient): RequiredAuthMaterial {
 
 function isReactNativeEnvironment(): boolean {
   // noinspection JSDeprecatedSymbols
-  return typeof navigator !== 'undefined' && navigator.product === 'ReactNative';
+  return true;
+  //return typeof navigator !== 'undefined' && navigator.product === 'ReactNative';
 }
 
 function isWebEnvironment(): boolean {
@@ -193,6 +216,82 @@ function normalizeRequestBody(body: AuthRequestInit['body']): BodyInit | undefin
   }
 
   return String(body);
+}
+
+function isMethodBodyCapable(method: string): boolean {
+  return !METHODS_WITHOUT_REQUEST_BODY.has(method.toUpperCase());
+}
+
+function cloneFormData(formData: FormData): FormData {
+  const cloned = new FormData();
+  formData.forEach((value, key) => {
+    cloned.append(key, value);
+  });
+  return cloned;
+}
+
+function resolveMultipartPayload(body: AuthRequestInit['body']): string {
+  if (body === null || body === undefined) {
+    return '';
+  }
+  if (typeof body === 'string') {
+    return body;
+  }
+  if (isPlainObject(body) || Array.isArray(body)) {
+    return JSON.stringify(body);
+  }
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+    return body.toString();
+  }
+  return String(body);
+}
+
+function prepareRequestBody(
+  method: string,
+  init: AuthRequestInit | AuthBodyRequestInit | undefined,
+): { body: BodyInit | undefined; shouldSetJsonContentType: boolean } {
+  const originalBody = init?.body;
+
+  if (!isMethodBodyCapable(method)) {
+    return {
+      body: normalizeRequestBody(originalBody),
+      shouldSetJsonContentType: isPlainObject(originalBody) || Array.isArray(originalBody),
+    };
+  }
+
+  const bodyRequestInit = init as AuthBodyRequestInit | undefined;
+  const multipartRequested = Boolean(bodyRequestInit?.multipart || bodyRequestInit?.formData);
+
+  if (!multipartRequested) {
+    return {
+      body: normalizeRequestBody(originalBody),
+      shouldSetJsonContentType: isPlainObject(originalBody) || Array.isArray(originalBody),
+    };
+  }
+
+  if (typeof FormData === 'undefined') {
+    throw new Error('multipart/form-data is not available in this runtime. Provide a fetch implementation with FormData support.');
+  }
+
+  if (typeof originalBody !== 'undefined' && isBodyInitValue(originalBody) && !(originalBody instanceof FormData)) {
+    throw new Error('multipart request bodies support plain objects, arrays, strings, and FormData.');
+  }
+
+  const multipartBody = bodyRequestInit?.formData ? cloneFormData(bodyRequestInit.formData) : new FormData();
+
+  if (originalBody instanceof FormData) {
+    return { body: cloneFormData(originalBody), shouldSetJsonContentType: false };
+  }
+
+  if (originalBody !== null && originalBody !== undefined) {
+    const fieldName = bodyRequestInit?.multipartBodyFieldName?.trim() || 'body';
+    multipartBody.append(fieldName, resolveMultipartPayload(originalBody));
+  }
+
+  return {
+    body: multipartBody,
+    shouldSetJsonContentType: false,
+  };
 }
 
 function joinPathSegments(basePath: string, requestPath: string): string {
@@ -519,16 +618,15 @@ async function buildRequestInit(
   client: AuthHttpClient,
   method: string,
   path: string,
-  init?: AuthRequestInit,
+  init?: AuthRequestInit | AuthBodyRequestInit,
 ): Promise<{ url: URL; requestInit: RequestInit }> {
   const resolvedUrl = resolveRequestUrl(client.baseURL, path);
-  const originalBody = init?.body;
   const { body: _ignoredBody, ...requestInitBase } = init ?? {};
-  const body = normalizeRequestBody(originalBody);
+  const { body, shouldSetJsonContentType } = prepareRequestBody(method, init);
   const headers = new Headers(init?.headers ?? undefined);
 
   //? Set the headers.
-  if (body !== undefined && !headers.has('content-type') && (isPlainObject(originalBody) || Array.isArray(originalBody))) {
+  if (body !== undefined && !headers.has('content-type') && shouldSetJsonContentType) {
     headers.set('content-type', 'application/json');
   }
 
@@ -626,12 +724,12 @@ export class AuthHttpClient {
     return this;
   }
 
-  /** Returns the configured IP address, if one was provided. */
+  /** Returns the configured IP address if one was provided. */
   public get ipAddress(): string | undefined {
     return this._ipAddress;
   }
 
-  /** Returns the configured device ID, if one was provided. */
+  /** Returns the configured device ID if one was provided. */
   public get deviceId(): string | undefined {
     return this._deviceId;
   }
@@ -661,21 +759,21 @@ export class AuthHttpClient {
   /**
    * Sends a POST request.
    */
-  public post(path: string, init?: AuthRequestInit): Promise<Response> {
+  public post(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('POST', path, init);
   }
 
   /**
    * Sends a PUT request.
    */
-  public put(path: string, init?: AuthRequestInit): Promise<Response> {
+  public put(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('PUT', path, init);
   }
 
   /**
    * Sends a PATCH request.
    */
-  public patch(path: string, init?: AuthRequestInit): Promise<Response> {
+  public patch(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('PATCH', path, init);
   }
 
@@ -689,7 +787,7 @@ export class AuthHttpClient {
   /**
    * Sends an OPTIONS request.
    */
-  public options(path: string, init?: AuthRequestInit): Promise<Response> {
+  public options(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('OPTIONS', path, init);
   }
 
@@ -717,98 +815,98 @@ export class AuthHttpClient {
   /**
    * Sends a COPY request.
    */
-  public copy(path: string, init?: AuthRequestInit): Promise<Response> {
+  public copy(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('COPY', path, init);
   }
 
   /**
    * Sends a MOVE request.
    */
-  public move(path: string, init?: AuthRequestInit): Promise<Response> {
+  public move(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('MOVE', path, init);
   }
 
   /**
    * Sends a LOCK request.
    */
-  public lock(path: string, init?: AuthRequestInit): Promise<Response> {
+  public lock(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('LOCK', path, init);
   }
 
   /**
    * Sends an UNLOCK request.
    */
-  public unlock(path: string, init?: AuthRequestInit): Promise<Response> {
+  public unlock(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('UNLOCK', path, init);
   }
 
   /**
    * Sends a PROPFIND request.
    */
-  public propfind(path: string, init?: AuthRequestInit): Promise<Response> {
+  public propfind(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('PROPFIND', path, init);
   }
 
   /**
    * Sends an MKCOL request.
    */
-  public mkcol(path: string, init?: AuthRequestInit): Promise<Response> {
+  public mkcol(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('MKCOL', path, init);
   }
 
   /**
    * Sends a SEARCH request.
    */
-  public search(path: string, init?: AuthRequestInit): Promise<Response> {
+  public search(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('SEARCH', path, init);
   }
 
   /**
    * Sends a REPORT request.
    */
-  public report(path: string, init?: AuthRequestInit): Promise<Response> {
+  public report(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('REPORT', path, init);
   }
 
   /**
    * Sends a CHECKIN request.
    */
-  public checkin(path: string, init?: AuthRequestInit): Promise<Response> {
+  public checkin(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('CHECKIN', path, init);
   }
 
   /**
    * Sends a CHECKOUT request.
    */
-  public checkout(path: string, init?: AuthRequestInit): Promise<Response> {
+  public checkout(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('CHECKOUT', path, init);
   }
 
   /**
    * Sends an UNCHECKOUT request.
    */
-  public uncheckout(path: string, init?: AuthRequestInit): Promise<Response> {
+  public uncheckout(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('UNCHECKOUT', path, init);
   }
 
   /**
    * Sends a MERGE request.
    */
-  public merge(path: string, init?: AuthRequestInit): Promise<Response> {
+  public merge(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('MERGE', path, init);
   }
 
   /**
    * Sends an ACL request.
    */
-  public acl(path: string, init?: AuthRequestInit): Promise<Response> {
+  public acl(path: string, init?: AuthBodyRequestInit): Promise<Response> {
     return this.custom('ACL', path, init);
   }
 
   /**
    * Sends a request using any HTTP method string supported by the backend.
    */
-  public custom(method: string, path: string, init?: AuthRequestInit): Promise<Response> {
+  public custom(method: string, path: string, init?: AuthRequestInit | AuthBodyRequestInit): Promise<Response> {
     return (async () => {
       const { url, requestInit } = await buildRequestInit(this, method.toUpperCase(), path, init);
       return this.fetchImpl(url.toString(), requestInit);

@@ -72,6 +72,43 @@ await client.post('/auth/login', {
 
 Plain objects and arrays are JSON-stringified automatically.
 
+### Multipart request bodies (file upload + JSON payload)
+
+For endpoints that parse multipart requests and expect the JSON payload in a form field (for example `body`), use `multipart: true` on body-capable methods (`POST`, `PUT`, `PATCH`, `OPTIONS`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`, `PROPFIND`, `MKCOL`, `SEARCH`, `REPORT`, `CHECKIN`, `CHECKOUT`, `UNCHECKOUT`, `MERGE`, `ACL`, or `custom(...)`):
+
+```ts
+const formData = new FormData();
+formData.append('file', selectedFile);
+
+await client.post('/files/upload', {
+  multipart: true,
+  formData,
+  body: {
+    folderId: 'abc123',
+    isPublic: false,
+  },
+});
+```
+
+This sends multipart form-data and injects the serialized payload into a `body` field by default.
+
+If your server uses a different field name:
+
+```ts
+await client.post('/files/upload', {
+  multipart: true,
+  multipartBodyFieldName: 'payload',
+  formData,
+  body: { folderId: 'abc123' },
+});
+```
+
+Backwards compatibility is preserved:
+
+- Existing JSON requests keep the same behavior.
+- Passing `body: FormData` still works unchanged.
+- The client does not force multipart on methods that typically do not require request bodies (`GET`, `HEAD`, `DELETE`, `CONNECT`, `TRACE`).
+
 ## Device identification
 
 The client resolves a device identifier depending on the runtime:
